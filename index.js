@@ -194,7 +194,7 @@ app.post('/slack/commands', async (req, res) => {
 });
 
 app.post('/webhook', async (req, res) => {
-  const { passcode, event_type, file_key, comment, triggered_by } = req.body;
+  const { passcode, event_type, file_key, comment, triggered_by, comment_id } = req.body;
   if (!passcode || passcode !== FIGMA_PASSCODE) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
@@ -204,8 +204,6 @@ app.post('/webhook', async (req, res) => {
   }
 
   const node_id = req.body.node_id ?? comment?.[0]?.node_id ?? '';
-  const comment_id = comment?.[0]?.id ?? null;
-  console.log(`[WEBHOOK] body_keys=${JSON.stringify(Object.keys(req.body))} comment_id=${comment_id} comment_keys=${JSON.stringify(Object.keys(comment?.[0] ?? {}))}`);
 
   if (!event_type || !file_key) {
     return res.status(400).json({ error: 'Missing event_type or file_key' });
