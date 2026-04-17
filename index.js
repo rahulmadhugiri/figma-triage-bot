@@ -1,12 +1,23 @@
 require('dotenv').config();
 
+const crypto = require('crypto');
 const express = require('express');
 const axios = require('axios');
 
 const app = express();
+
+// Capture raw body for Slack signature verification before any parsing
+app.use('/slack/commands', express.raw({ type: '*/*' }));
 app.use(express.json());
 
-const { FIGMA_PASSCODE, SLACK_WEBHOOK_URL, PORT } = process.env;
+const {
+  FIGMA_PASSCODE,
+  SLACK_WEBHOOK_URL,
+  SLACK_SIGNING_SECRET,
+  FIGMA_TOKEN,
+  RENDER_URL,
+  PORT,
+} = process.env;
 
 if (!FIGMA_PASSCODE || !SLACK_WEBHOOK_URL) {
   console.error('ERROR: FIGMA_PASSCODE and SLACK_WEBHOOK_URL must be set in environment.');
@@ -24,21 +35,98 @@ async function postToSlack(text) {
   }
 }
 
+function verifySlackSignature(req) {
+  if (!SLACK_SIGNING_SECRET) return false;
+  const timestamp = req.headers['x-slack-request-timestamp'];
+  const signature = req.headers['x-slack-signature'];
+  if (!timestamp || !signature) return false;
+  if (Math.abs(Date.now() / 1000 - Number(timestamp)) > 300) return false;
+
+  const rawBody = req.body.toString();
+  const sigBase = `v0:${timestamp}:${rawBody}`;
+  const computed = `v0=${crypto.createHmac('sha256', SLACK_SIGNING_SECRET).update(sigBase).digest('hex')}`;
+  try {
+    return crypto.timingSafeEqual(Buffer.from(computed), Buffer.from(signature));
+  } catch {
+    return false;
+  }
+}
+
+function extractFileKey(url) {
+  const match = url.match(/figma\.com\/(?:file|board|design)\/([a-zA-Z0-9]+)/);
+  return match ? match[1] : null;
+}
+
+async function registerFigmaWebhook(file_key, event_type) {
+  const body = {
+    event_type,
+    context: 'file',
+    context_id: file_key,
+    endpoint: `${RENDER_URL}/webhook`,
+    passcode: FIGMA_PASSCODE,
+  };
+  const { data } = await axios.post('https://api.figma.com/v2/webhooks', body, {
+    headers: { 'X-Figma-Token': FIGMA_TOKEN, 'Content-Type': 'application/json' },
+  });
+  return data.id;
+}
+
 app.get('/health', (_req, res) => res.sendStatus(200));
 
+// /add-file <figma-url> — registers webhooks for a new file without touching code
+app.post('/slack/commands', async (req, res) => {
+  if (!verifySlackSignature(req)) {
+    return res.status(401).send('Unauthorized');
+  }
+
+  const params = new URLSearchParams(req.body.toString());
+  const command = params.get('command');
+  const text = (params.get('text') ?? '').trim();
+
+  if (command !== '/add-file') {
+    return res.json({ response_type: 'ephemeral', text: `Unknown command: ${command}` });
+  }
+
+  if (!text) {
+    return res.json({ response_type: 'ephemeral', text: 'Usage: `/add-file <figma-url>`' });
+  }
+
+  const file_key = extractFileKey(text);
+  if (!file_key) {
+    return res.json({ response_type: 'ephemeral', text: `Could not extract a file key from: ${text}` });
+  }
+
+  if (!FIGMA_TOKEN || !RENDER_URL) {
+    return res.json({ response_type: 'ephemeral', text: 'Server is missing FIGMA_TOKEN or RENDER_URL env vars.' });
+  }
+
+  try {
+    const [commentId, updateId] = await Promise.all([
+      registerFigmaWebhook(file_key, 'FILE_COMMENT'),
+      registerFigmaWebhook(file_key, 'FILE_UPDATE'),
+    ]);
+    console.log(`[/add-file] Registered webhooks for ${file_key} — comment: ${commentId}, update: ${updateId}`);
+    return res.json({
+      response_type: 'in_channel',
+      text: `Now monitoring \`${file_key}\`\nFILE_COMMENT webhook ID: ${commentId}\nFILE_UPDATE webhook ID: ${updateId}`,
+    });
+  } catch (err) {
+    const message = err.response?.data?.message ?? err.message;
+    console.error(`[/add-file] Failed to register webhooks for ${file_key}: ${message}`);
+    return res.json({ response_type: 'ephemeral', text: `Failed to register webhooks: ${message}` });
+  }
+});
+
 app.post('/webhook', async (req, res) => {
-  // Fix 1: Figma V2 sends passcode in the JSON body, not a header
   const { passcode, event_type, file_key, comment, triggered_by } = req.body;
   if (!passcode || passcode !== FIGMA_PASSCODE) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
-  // Fix 2: Figma sends event_type "PING" during webhook registration — ACK immediately
   if (event_type === 'PING') {
     return res.status(200).send('OK');
   }
 
-  // node_id may live at top level or inside comment[0]
   const node_id = req.body.node_id ?? comment?.[0]?.node_id ?? '';
 
   if (!event_type || !file_key) {
