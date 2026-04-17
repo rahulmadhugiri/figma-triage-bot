@@ -100,21 +100,32 @@ app.post('/slack/commands', async (req, res) => {
     return res.json({ response_type: 'ephemeral', text: 'Server is missing FIGMA_TOKEN or RENDER_URL env vars.' });
   }
 
-  try {
-    const [commentId, updateId] = await Promise.all([
-      registerFigmaWebhook(file_key, 'FILE_COMMENT'),
-      registerFigmaWebhook(file_key, 'FILE_UPDATE'),
-    ]);
-    console.log(`[/add-file] Registered webhooks for ${file_key} — comment: ${commentId}, update: ${updateId}`);
-    return res.json({
-      response_type: 'in_channel',
-      text: `Now monitoring \`${file_key}\`\nFILE_COMMENT webhook ID: ${commentId}\nFILE_UPDATE webhook ID: ${updateId}`,
-    });
-  } catch (err) {
-    const message = err.response?.data?.message ?? err.message;
-    console.error(`[/add-file] Failed to register webhooks for ${file_key}: ${message}`);
-    return res.json({ response_type: 'ephemeral', text: `Failed to register webhooks: ${message}` });
-  }
+  const response_url = params.get('response_url');
+
+  // Acknowledge Slack immediately — must respond within 3 seconds
+  res.json({ response_type: 'ephemeral', text: `Registering webhooks for \`${file_key}\`...` });
+
+  // Do Figma API work in background, then post result back via response_url
+  (async () => {
+    try {
+      const [commentId, updateId] = await Promise.all([
+        registerFigmaWebhook(file_key, 'FILE_COMMENT'),
+        registerFigmaWebhook(file_key, 'FILE_UPDATE'),
+      ]);
+      console.log(`[/add-file] Registered webhooks for ${file_key} — comment: ${commentId}, update: ${updateId}`);
+      await axios.post(response_url, {
+        response_type: 'in_channel',
+        text: `Now monitoring \`${file_key}\`\nFILE_COMMENT webhook ID: ${commentId}\nFILE_UPDATE webhook ID: ${updateId}`,
+      });
+    } catch (err) {
+      const message = err.response?.data?.message ?? err.message;
+      console.error(`[/add-file] Failed to register webhooks for ${file_key}: ${message}`);
+      await axios.post(response_url, {
+        response_type: 'ephemeral',
+        text: `Failed to register webhooks: ${message}`,
+      });
+    }
+  })();
 });
 
 app.post('/webhook', async (req, res) => {
