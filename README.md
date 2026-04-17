@@ -44,6 +44,8 @@ The bot extracts the file key, registers both `FILE_COMMENT` and `FILE_UPDATE` w
 
 ## Architecture
 
+### High-Level Flow
+
 ```
 Figma comment (#tech / #coach)
     │
@@ -79,6 +81,102 @@ Express Server (Render)
     ▼
 Slack confirmation (webhook IDs posted in channel)
 ```
+
+---
+
+### Deep Dive
+
+#### 1. Middleware ordering and raw body capture
+
+Express parses request bodies before route handlers run. For Figma webhooks, JSON parsing is fine. But Slack's security model requires verifying a HMAC-SHA256 signature computed against the **raw, unparsed request body** — if Express parses it first, the original bytes are gone and verification fails.
+
+To solve this, `express.raw({ type: '*/*' })` is registered specifically for the two Slack routes **before** `express.json()` runs globally. This gives those routes access to `req.body` as a raw `Buffer`, which is then converted to a string for signature verification and manually parsed (`URLSearchParams` for commands, `JSON.parse` for events).
+
+```js
+app.use('/slack/commands', express.raw({ type: '*/*' }));
+app.use('/slack/events',   express.raw({ type: '*/*' }));
+app.use(express.json()); // all other routes get parsed JSON
+```
+
+#### 2. Slack request verification
+
+Every request from Slack (slash commands and events) is verified using HMAC-SHA256 before any logic runs:
+
+```
+signature_base = "v0:" + timestamp + ":" + raw_body
+computed       = "v0=" + HMAC-SHA256(SLACK_SIGNING_SECRET, signature_base)
+```
+
+The computed value is compared to the `x-slack-signature` header using `crypto.timingSafeEqual` — a constant-time comparison that prevents timing attacks. A 5-minute timestamp window (`Math.abs(Date.now()/1000 - timestamp) > 300`) blocks replay attacks.
+
+#### 3. Figma webhook authentication
+
+Figma V2 webhooks send the passcode in the **JSON body** (not headers, which was V1 behavior). The server rejects any request where `req.body.passcode !== FIGMA_PASSCODE`. This prevents arbitrary POST requests from triggering Slack alerts.
+
+Figma also sends a one-time `PING` event immediately after webhook registration to confirm the endpoint is reachable. The server returns `200 OK` instantly without running any routing logic, which is required for registration to succeed.
+
+#### 4. The ts → comment_id message map
+
+This is the bridge that connects a Slack reaction back to the right Figma comment. When a triage alert fires, the server uses `chat.postMessage` (Slack Web API) instead of a simple Incoming Webhook — because `chat.postMessage` returns the message's unique timestamp (`ts`) in the response, while Incoming Webhooks do not.
+
+```
+chat.postMessage response → { ok: true, ts: "1776461008.561239", ... }
+```
+
+This `ts` is stored in an in-memory `Map` alongside the Figma `file_key` and `comment_id`:
+
+```js
+messageMap.set(ts, { file_key, comment_id, node_id });
+```
+
+When a `reaction_added` event arrives from Slack, the reacted message's `ts` is used to look up the entry and retrieve the exact Figma comment to reply to. No database needed.
+
+**Trade-off:** the map lives in memory, so a server restart clears it. Reactions on alerts sent before the last deploy are silently ignored. For a live workshop context this is acceptable — the window between deploy and workshop is managed manually.
+
+#### 5. Figma comment threading
+
+To post a reply inside an existing comment thread (rather than a new top-level comment), the Figma REST API requires the `comment_id` field in the request body pointing to the root comment:
+
+```
+POST /v1/files/{file_key}/comments
+{ "message": "👋 Help is on the way!", "comment_id": "1723993803" }
+```
+
+Note: this field is named `comment_id` — **not** `parent_id`. The Figma webhook payload also contains a field called `comment_id` at the top level of the body (not nested inside the `comment` array), which is what gets stored in the map and used here.
+
+#### 6. Slack 3-second timeout and deferred responses
+
+Slack requires slash command endpoints to respond within **3 seconds** or it shows the user a failure message. On a free Render instance with a cold start of 30-50 seconds, this is impossible to guarantee.
+
+The solution: respond to Slack immediately with an acknowledgment, then do the slow work (Figma API calls) asynchronously in a self-invoking async function. The result is posted back to Slack using the `response_url` from the original slash command payload, which stays valid for 30 minutes:
+
+```js
+res.json({ response_type: 'ephemeral', text: 'Registering...' }); // instant ACK
+
+(async () => {
+  const ids = await registerFigmaWebhooks(file_key); // slow work
+  await axios.post(response_url, { text: `Done: ${ids}` }); // deferred response
+})();
+```
+
+The same pattern applies to the `/slack/events` endpoint — `res.sendStatus(200)` is called before any Figma API work begins, satisfying Slack's requirement that events are acknowledged within 3 seconds.
+
+#### 7. Figma Webhooks V2 registration
+
+The Figma V2 API registers webhooks using `context` + `context_id` instead of the V1 `file_key` field:
+
+```js
+POST https://api.figma.com/v2/webhooks
+{
+  event_type: "FILE_COMMENT",
+  context:    "file",
+  context_id: "ggs5L02F7m9xvWfJhVHDcg",
+  endpoint:   "https://figma-triage-bot.onrender.com/webhook",
+  passcode:   "FigmaBot"
+}
+```
+
+Two webhooks are registered per file: `FILE_COMMENT` (triggers the triage alert pipeline) and `FILE_UPDATE` (received but not currently acted on — preserved for future use).
 
 ---
 
