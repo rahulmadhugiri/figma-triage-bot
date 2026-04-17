@@ -6,19 +6,16 @@ const axios = require('axios');
 
 const app = express();
 
-// Log every incoming request for debugging
-app.use((req, _res, next) => {
-  console.log(`[REQUEST] ${req.method} ${req.path}`);
-  next();
-});
-
 // Capture raw body for Slack signature verification before any parsing
 app.use('/slack/commands', express.raw({ type: '*/*' }));
+app.use('/slack/events', express.raw({ type: '*/*' }));
 app.use(express.json());
 
 const {
   FIGMA_PASSCODE,
   SLACK_WEBHOOK_URL,
+  SLACK_BOT_TOKEN,
+  SLACK_CHANNEL_ID,
   SLACK_SIGNING_SECRET,
   FIGMA_TOKEN,
   RENDER_URL,
@@ -33,11 +30,28 @@ if (!FIGMA_PASSCODE || !SLACK_WEBHOOK_URL) {
 // file_key → { lastUpdated: number, warningSent: boolean }
 const fileTimestamps = {};
 
+// slack message ts → { file_key, comment_id, node_id }
+const messageMap = new Map();
+
+// Post to Slack — uses chat.postMessage (returns ts) if bot token is configured,
+// falls back to Incoming Webhook otherwise
 async function postToSlack(text) {
   try {
-    await axios.post(SLACK_WEBHOOK_URL, { text });
+    if (SLACK_BOT_TOKEN && SLACK_CHANNEL_ID) {
+      const { data } = await axios.post(
+        'https://slack.com/api/chat.postMessage',
+        { channel: SLACK_CHANNEL_ID, text },
+        { headers: { Authorization: `Bearer ${SLACK_BOT_TOKEN}`, 'Content-Type': 'application/json' } }
+      );
+      if (!data.ok) console.error('Slack API error:', data.error);
+      return data.ts ?? null;
+    } else {
+      await axios.post(SLACK_WEBHOOK_URL, { text });
+      return null;
+    }
   } catch (err) {
     console.error('Failed to post to Slack:', err.message);
+    return null;
   }
 }
 
@@ -77,7 +91,56 @@ async function registerFigmaWebhook(file_key, event_type) {
   return data.id;
 }
 
+// Log every incoming request for debugging
+app.use((req, _res, next) => {
+  console.log(`[REQUEST] ${req.method} ${req.path}`);
+  next();
+});
+
 app.get('/health', (_req, res) => res.sendStatus(200));
+
+// Slack Event Subscriptions — reaction_added → reply in Figma
+app.post('/slack/events', (req, res) => {
+  if (!verifySlackSignature(req)) {
+    return res.status(401).send('Unauthorized');
+  }
+
+  const body = JSON.parse(req.body.toString());
+
+  // One-time URL verification handshake when setting up Event Subscriptions
+  if (body.type === 'url_verification') {
+    return res.json({ challenge: body.challenge });
+  }
+
+  // Acknowledge Slack immediately
+  res.sendStatus(200);
+
+  const event = body.event;
+  if (!event || event.type !== 'reaction_added') return;
+  if (event.item?.type !== 'message') return;
+
+  const TRIGGER_EMOJIS = new Set(['eyes', 'rocket', '+1', 'thumbsup']);
+  if (!TRIGGER_EMOJIS.has(event.reaction)) return;
+
+  const entry = messageMap.get(event.item.ts);
+  if (!entry) {
+    console.log(`[REACTION] No mapped message for ts ${event.item.ts}, skipping.`);
+    return;
+  }
+
+  (async () => {
+    try {
+      await axios.post(
+        `https://api.figma.com/v1/files/${entry.file_key}/comments`,
+        { message: '👋 Help is on the way!', parent_id: entry.comment_id },
+        { headers: { 'X-Figma-Token': FIGMA_TOKEN, 'Content-Type': 'application/json' } }
+      );
+      console.log(`[REACTION] Figma reply posted for ${entry.file_key} comment ${entry.comment_id}`);
+    } catch (err) {
+      console.error('[REACTION] Failed to post Figma reply:', err.response?.data ?? err.message);
+    }
+  })();
+});
 
 // /add-file <figma-url> — registers webhooks for a new file without touching code
 app.post('/slack/commands', async (req, res) => {
@@ -111,7 +174,6 @@ app.post('/slack/commands', async (req, res) => {
   // Acknowledge Slack immediately — must respond within 3 seconds
   res.json({ response_type: 'ephemeral', text: `Registering webhooks for \`${file_key}\`...` });
 
-  // Do Figma API work in background, then post result back via response_url
   (async () => {
     try {
       const [commentId, updateId] = await Promise.all([
@@ -145,6 +207,7 @@ app.post('/webhook', async (req, res) => {
   }
 
   const node_id = req.body.node_id ?? comment?.[0]?.node_id ?? '';
+  const comment_id = comment?.[0]?.id ?? null;
 
   if (!event_type || !file_key) {
     return res.status(400).json({ error: 'Missing event_type or file_key' });
@@ -172,10 +235,16 @@ app.post('/webhook', async (req, res) => {
         `${alertType}\n` +
         `*User:* ${userName}\n` +
         `*Comment:* ${text}\n` +
-        `*Link:* ${deepLink}`;
+        `*Link:* ${deepLink}\n` +
+        `_React with 👀 👍 🚀 to notify them help is on the way_`;
 
-      await postToSlack(slackMessage);
-      console.log(`[FILE_COMMENT] Alert sent for ${file_key} — ${alertType}`);
+      const ts = await postToSlack(slackMessage);
+      if (ts && comment_id) {
+        messageMap.set(ts, { file_key, comment_id, node_id });
+        console.log(`[FILE_COMMENT] Alert sent and mapped ts=${ts} → comment ${comment_id}`);
+      } else {
+        console.log(`[FILE_COMMENT] Alert sent for ${file_key} — ${alertType}`);
+      }
     } else {
       console.log(`[FILE_COMMENT] No trigger keyword in comment for ${file_key}, skipping.`);
     }
