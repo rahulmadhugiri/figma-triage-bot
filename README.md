@@ -16,7 +16,7 @@ No UI. No Figma plugin. Pure Node.js webhook receiver → Slack alerts.
 4. Within seconds, a formatted alert appears in your Slack channel with the user's name, their comment, and a direct deep link to the exact frame in Figma
 5. The tech support person reacts to the Slack alert with 👀 👍 or 🚀
 6. The bot automatically posts `"👋 Help is on the way!"` as a threaded reply on the original Figma comment — notifying the participant instantly
-7. The issue gets resolved — **without Heather ever pausing the lesson**
+7. The issue gets resolved — **without the lead coach ever pausing the lesson**
 
 ### Trigger Keywords
 
