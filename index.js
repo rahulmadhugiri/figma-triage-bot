@@ -205,7 +205,7 @@ app.post('/webhook', async (req, res) => {
 
   const node_id = req.body.node_id ?? comment?.[0]?.node_id ?? '';
   const comment_id = comment?.[0]?.id ?? null;
-  console.log(`[WEBHOOK] event=${event_type} file=${file_key} comment_id=${comment_id} comment_keys=${JSON.stringify(Object.keys(comment?.[0] ?? {}))}`);
+  console.log(`[WEBHOOK] body_keys=${JSON.stringify(Object.keys(req.body))} comment_id=${comment_id} comment_keys=${JSON.stringify(Object.keys(comment?.[0] ?? {}))}`);
 
   if (!event_type || !file_key) {
     return res.status(400).json({ error: 'Missing event_type or file_key' });
