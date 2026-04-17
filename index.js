@@ -27,9 +27,6 @@ if (!FIGMA_PASSCODE || !SLACK_WEBHOOK_URL) {
   process.exit(1);
 }
 
-// file_key → { lastUpdated: number, warningSent: boolean }
-const fileTimestamps = {};
-
 // slack message ts → { file_key, comment_id, node_id }
 const messageMap = new Map();
 
@@ -249,8 +246,7 @@ app.post('/webhook', async (req, res) => {
       console.log(`[FILE_COMMENT] No trigger keyword in comment for ${file_key}, skipping.`);
     }
   } else if (event_type === 'FILE_UPDATE') {
-    fileTimestamps[file_key] = { lastUpdated: Date.now(), warningSent: false };
-    console.log(`[FILE_UPDATE] Timestamp reset for ${file_key}`);
+    console.log(`[FILE_UPDATE] Received for ${file_key}`);
   } else {
     console.log(`[WEBHOOK] Ignored event type: ${event_type}`);
   }
@@ -258,23 +254,6 @@ app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
 });
 
-// Inactivity monitor — runs every 60 s, warns after 7 min of silence
-const INACTIVITY_THRESHOLD_MS = 7 * 60 * 1000;
-const CHECK_INTERVAL_MS = 60 * 1000;
-
-setInterval(async () => {
-  const now = Date.now();
-  for (const [key, state] of Object.entries(fileTimestamps)) {
-    if (!state.warningSent && now - state.lastUpdated > INACTIVITY_THRESHOLD_MS) {
-      const msg =
-        `[⚠️ INACTIVITY WARNING] File \`${key}\` has not had any edits in 7 minutes. ` +
-        `They may be quietly falling behind.`;
-      await postToSlack(msg);
-      state.warningSent = true;
-      console.log(`[INACTIVITY] Warning sent for ${key}`);
-    }
-  }
-}, CHECK_INTERVAL_MS);
 
 const port = PORT || 3000;
 app.listen(port, () => {
