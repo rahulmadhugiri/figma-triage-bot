@@ -129,7 +129,7 @@ app.post('/slack/events', (req, res) => {
     try {
       await axios.post(
         `https://api.figma.com/v1/files/${entry.file_key}/comments`,
-        { message: '👋 Help is on the way!', parent_id: entry.comment_id },
+        { message: '👋 Help is on the way!', comment_id: String(entry.comment_id) },
         { headers: { 'X-Figma-Token': FIGMA_TOKEN, 'Content-Type': 'application/json' } }
       );
       console.log(`[REACTION] Figma reply posted for ${entry.file_key} comment ${entry.comment_id}`);
