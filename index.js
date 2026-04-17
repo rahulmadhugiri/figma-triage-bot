@@ -6,6 +6,12 @@ const axios = require('axios');
 
 const app = express();
 
+// Log every incoming request for debugging
+app.use((req, _res, next) => {
+  console.log(`[REQUEST] ${req.method} ${req.path}`);
+  next();
+});
+
 // Capture raw body for Slack signature verification before any parsing
 app.use('/slack/commands', express.raw({ type: '*/*' }));
 app.use(express.json());
