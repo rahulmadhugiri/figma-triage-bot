@@ -1,0 +1,17 @@
+{
+  "name": "figma-triage-bot",
+  "version": "1.0.0",
+  "description": "Figma webhook → Slack alert bot for live design workshops",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "axios": "^1.6.7",
+    "dotenv": "^16.4.5",
+    "express": "^4.18.2"
+  }
+}
